@@ -18,6 +18,10 @@ Automates retailer creation, approval, rejection, and lead creation on
    ```
    cp .env.example .env
    ```
+   On Windows PowerShell, use:
+   ```powershell
+   Copy-Item .env.example .env
+   ```
    Then open `.env` and replace the placeholder values. **Never share this
    file or paste its contents into a chat.**
 
