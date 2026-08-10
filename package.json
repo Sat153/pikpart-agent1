@@ -1,0 +1,16 @@
+{
+  "name": "pikpart-agent1-admin",
+  "version": "1.0.0",
+  "description": "Agent 1 - Sales/Admin test automation for uatadmin.pikpart.com",
+  "type": "commonjs",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "codegen": "playwright codegen https://uatadmin.pikpart.com/",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.47.0",
+    "dotenv": "^16.4.5"
+  }
+}
