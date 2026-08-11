@@ -7,6 +7,8 @@
     "test": "playwright test",
     "test:headed": "playwright test --headed",
     "codegen": "playwright codegen https://uatadmin.pikpart.com/",
+    "codegen:merchant": "playwright codegen https://uatmerchant.pikpart.com/",
+    "codegen:ecom": "playwright codegen https://uat.pikpart.com/",
     "report": "playwright show-report"
   },
   "devDependencies": {
