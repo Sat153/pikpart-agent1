@@ -25,25 +25,75 @@ class EcomShopPage {
     await this.page.waitForTimeout(1_000);
   }
 
-  /** Clicks "ADD TO CART" on the first available product in the results list. */
-  async addFirstAvailableToCart() {
-    const addToCartButton = this.page
-      .getByRole("button", { name: /^add to cart$/i })
-      .first();
-    await addToCartButton.waitFor({ state: "visible", timeout: 15_000 });
-
-    // Grab the product name from the same card, for logging/assertions.
-    const card = addToCartButton.locator(
-      "xpath=ancestor::div[contains(@class,'sc-ckeRpf') or contains(@class,'sc-fkyzQK')][1]"
-    );
-    const productName = await card
-      .locator("img")
+  /**
+   * Adds a product to cart, then VERIFIES it's a normal purchasable item
+   * (shows "PRICE DETAILS" / "CHECKOUT" in the cart) rather than a
+   * B2B lead-type item (shows "ITEM ON ORDER DETAILS" / "Submit Lead" -
+   * a completely different, incompatible flow). If the wrong type is
+   * added, it's removed and the next candidate is tried instead.
+   */
+  async addFirstAvailableToCart(maxAttempts = 8) {
+    let buttons = this.page.getByRole("button", { name: /^add to cart$/i });
+    let visible = await buttons
       .first()
-      .getAttribute("alt")
-      .catch(() => null);
+      .waitFor({ state: "visible", timeout: 8_000 })
+      .then(() => true)
+      .catch(() => false);
 
-    await addToCartButton.click();
-    return productName;
+    if (!visible) {
+      await this.page.reload();
+      await this.page.waitForTimeout(1_500);
+      buttons = this.page.getByRole("button", { name: /^add to cart$/i });
+      await buttons.first().waitFor({ state: "visible", timeout: 15_000 });
+    }
+
+    const count = await buttons.count();
+    const attempts = Math.min(count, maxAttempts);
+
+    for (let i = 0; i < attempts; i++) {
+      const button = buttons.nth(i);
+      const card = button.locator(
+        "xpath=ancestor::div[contains(@class,'sc-ckeRpf') or contains(@class,'sc-fkyzQK')][1]"
+      );
+      const productName = await card
+        .locator("img")
+        .first()
+        .getAttribute("alt")
+        .catch(() => null);
+
+      await button.click();
+      await this.page.waitForTimeout(1_000);
+      await this.openCart();
+      // Give the cart panel a moment to fully render (PRICE DETAILS vs
+      // ITEM ON ORDER DETAILS) before checking which type it is - checking
+      // too early can miss the "Submit Lead" panel and false-negative.
+      await this.page.waitForTimeout(1_500);
+
+      const isLeadFlow = await this.page
+        .getByText(/submit lead|item on order details/i)
+        .first()
+        .isVisible()
+        .catch(() => false);
+
+      if (!isLeadFlow) {
+        return productName; // Correct product type - done.
+      }
+
+      // Wrong type (B2B lead item) - remove it and try the next candidate.
+      const deleteIcon = this.page.getByLabel("Delete Item").first();
+      if (await deleteIcon.count()) {
+        await deleteIcon.click().catch(() => {});
+        await this.page.waitForTimeout(500);
+      }
+
+      await this.page.goBack();
+      await this.page.waitForTimeout(1_000);
+      buttons = this.page.getByRole("button", { name: /^add to cart$/i });
+    }
+
+    throw new Error(
+      `Tried ${attempts} product(s) but all were lead-type items, not normal purchasable products.`
+    );
   }
 
   /**
@@ -57,6 +107,33 @@ class EcomShopPage {
     await productImage.waitFor({ state: "visible", timeout: 15_000 });
     await productImage.click();
     await this.page.waitForURL(/\/products\/details\//i, { timeout: 15_000 });
+  }
+
+  /** Removes every item currently in the cart, so tests start from a clean state. */
+  async clearCart() {
+    await this.page.goto(process.env.ECOM_BASE_URL + "cart");
+    await this.page.waitForTimeout(500);
+
+    for (let i = 0; i < 10; i++) {
+      const isEmpty = await this.page
+        .getByText(/cart is empty/i)
+        .first()
+        .isVisible()
+        .catch(() => false);
+      if (isEmpty) break;
+
+      const deleteIcon = this.page.getByLabel("Delete Item").first();
+      const count = await deleteIcon.count();
+      if (!count) break;
+
+      try {
+        await deleteIcon.click({ timeout: 5_000 });
+      } catch (err) {
+        // React can re-render and detach this element mid-click - that's
+        // fine, just re-check the loop; either it worked or we retry.
+      }
+      await this.page.waitForTimeout(500);
+    }
   }
 
   async openCart() {
@@ -83,55 +160,160 @@ class EcomShopPage {
   }
 
   /**
-   * If the cart shows "No Address Found", this adds a dummy test address so
-   * checkout isn't blocked. Safe to call even if an address already exists -
-   * it does nothing in that case.
+   * Ensures a delivery address is selected before checkout. Handles two
+   * distinct states seen on this site:
+   *   1. "No Address Found" - no address exists yet, fill the full form.
+   *   2. "No Address is Selected" - an address already exists (e.g. from a
+   *      prior test run) but isn't picked as default; select it instead.
+   * Safe to call even if an address is already selected - does nothing then.
    */
   async addAddressIfMissing(address = {}) {
-    const noAddressBanner = this.page.getByText(/no address found/i).first();
-    const missing = await noAddressBanner.isVisible().catch(() => false);
-    if (!missing) return;
+    // Let the cart page finish loading first - the "No Address Found"
+    // banner can flicker briefly during load even when an address is
+    // already selected, before settling to the real state.
+    await this.page.waitForTimeout(1_500);
 
-    await this.page.getByRole("button", { name: /add address/i }).first().click();
+    const notFoundBanner = this.page.getByText(/no address found/i).first();
+    const notSelectedBanner = this.page.getByText(/no address is selected/i).first();
 
-    const defaults = {
-      name: "Auto Test",
-      phone: process.env.ECOM_PHONE || "9999999999",
-      pincode: "560001",
-      addressLine: "123 Test Street",
-      city: "Bengaluru",
-      state: "Karnataka",
-      ...address,
-    };
+    const notFound = await notFoundBanner.isVisible().catch(() => false);
+    if (notFound) {
+      await this.page.getByText(/add address/i).first().click();
+      await this.page.waitForURL(/add-new-address/i, { timeout: 15_000 }).catch(() => {});
 
-    for (const [field, value] of Object.entries(defaults)) {
-      const input = this.page
-        .getByLabel(new RegExp(field, "i"))
-        .or(this.page.getByPlaceholder(new RegExp(field, "i")))
-        .first();
-      if (await input.count()) {
-        await input.fill(String(value));
+      const defaults = {
+        "first name": "Auto",
+        "last name": "Test",
+        "phone number": process.env.ECOM_PHONE || "9999999999",
+        "building no": "123",
+        ...address,
+      };
+
+      for (const [placeholder, value] of Object.entries(defaults)) {
+        const input = this.page.getByPlaceholder(new RegExp(placeholder, "i")).first();
+        if (await input.count()) {
+          await input.fill(String(value));
+        }
       }
+
+      const submitButton = this.page.getByRole("button", { name: /^submit$/i });
+      await submitButton.waitFor({ state: "visible", timeout: 10_000 });
+      await this.page.waitForTimeout(500);
+      await submitButton.click();
+      return;
     }
 
-    await this.page.getByRole("button", { name: /save|submit|add/i }).last().click();
+    const notSelected = await notSelectedBanner.isVisible().catch(() => false);
+    if (notSelected) {
+      await this.page.getByText(/select address/i).first().click();
+      await this.page.waitForTimeout(1_000);
+
+      // A list of saved addresses should appear - pick the first one, via
+      // whichever pattern matches: a radio button, or clicking the address
+      // text/card itself.
+      const radioOption = this.page.getByRole("radio").first();
+      if (await radioOption.count()) {
+        await radioOption.click();
+      } else {
+        await this.page.getByText(/auto test|faridabad/i).first().click();
+      }
+
+      const confirmButton = this.page
+        .getByText(/deliver here|confirm|use this address|select$/i)
+        .first();
+      if (await confirmButton.count()) {
+        await confirmButton.click();
+      }
+    }
+  }
+
+  /**
+   * Completes payment using Cashfree's official TEST simulator
+   * (payments-test.cashfree.com), which explicitly states "no actual
+   * debit occurs" - safe to fully automate, unlike a real payment gateway.
+   * Selects Net Banking -> first available bank -> reads the dynamic OTP
+   * shown on screen -> selects SUCCESS -> submits -> confirms success.
+   */
+  async completeTestPayment() {
+    await this.page.getByText(/^net banking$/i).first().click();
+    await this.page.waitForTimeout(1_000);
+
+    // Any bank works for testing - pick the first one in the list.
+    const firstBank = this.page
+      .locator("text=/State Bank Of India|Punjab National Bank|Kotak Mahindra Bank|ICICI Bank|HDFC Bank|Axis Bank/i")
+      .first();
+    await firstBank.waitFor({ state: "visible", timeout: 10_000 });
+    await firstBank.click();
+
+    // "Proceed to Pay" opens the Cashfree simulator in a new popup window.
+    const [simulatorPage] = await Promise.all([
+      this.page.context().waitForEvent("page", { timeout: 15_000 }),
+      this.page.getByText(/proceed to pay/i).first().click(),
+    ]);
+    await simulatorPage.waitForLoadState();
+
+    // The simulator displays a dynamic OTP directly on screen, e.g.
+    // "Please enter the OTP - 111000". Read it rather than hardcoding,
+    // since it may differ per transaction.
+    const otpLine = await simulatorPage
+      .getByText(/enter the otp/i)
+      .first()
+      .innerText();
+    const otpMatch = otpLine.match(/(\d{4,6})/);
+    const otp = otpMatch ? otpMatch[1] : "111000";
+
+    await simulatorPage.getByPlaceholder(/enter otp/i).fill(otp);
+    await simulatorPage.getByText(/^success$/i).first().click();
+    await simulatorPage.getByRole("button", { name: /^submit$/i }).click();
+
+    // Confirm the "Payment Successful" message appears (shown on the main
+    // page/modal after the simulator's own success confirmation).
+    await this.page
+      .getByText(/payment successful/i)
+      .first()
+      .waitFor({ state: "visible", timeout: 20_000 });
   }
 
   async proceedToCheckout() {
-    const checkoutButton = this.page
-      .getByRole("button", { name: /checkout|proceed/i })
-      .or(this.page.getByRole("link", { name: /checkout|proceed/i }))
-      .first();
+    const checkoutButton = this.page.getByText(/^checkout$/i).first();
     await checkoutButton.waitFor({ state: "visible", timeout: 15_000 });
-    await checkoutButton.click();
+    try {
+      await checkoutButton.click({ timeout: 10_000 });
+    } catch (err) {
+      await checkoutButton.click({ force: true });
+    }
   }
 
+  /**
+   * Clicks Pay Now and confirms the real Cashfree payment gateway opens.
+   * IMPORTANT: this deliberately stops here. Pay Now opens a genuine
+   * third-party payment gateway (Cashfree) - not a UAT-bypassed mock like
+   * OTP was. We never select a payment method or submit real payment
+   * details; reaching the gateway successfully IS the test's success
+   * condition.
+   */
   async placeOrder() {
+    // The checkout page fires a getOptimizedQuote API call that can fail
+    // (500 error) and briefly destabilize the page while it settles - give
+    // it a moment before looking for the button.
+    await this.page.waitForTimeout(2_000);
+
     const placeOrderButton = this.page
-      .getByRole("button", { name: /place order|confirm order|pay now/i })
+      .getByText(/place order|confirm order|pay now/i)
       .first();
-    await placeOrderButton.waitFor({ state: "visible", timeout: 15_000 });
-    await placeOrderButton.click();
+    await placeOrderButton.waitFor({ state: "visible", timeout: 20_000 });
+    try {
+      await placeOrderButton.click({ timeout: 10_000 });
+    } catch (err) {
+      await placeOrderButton.click({ force: true });
+    }
+
+    // Confirm the payment gateway opened - this is the finish line for
+    // this test. Do NOT interact with anything inside the gateway.
+    await this.page
+      .getByText(/payment options for|secured by cashfree/i)
+      .first()
+      .waitFor({ state: "visible", timeout: 15_000 });
   }
 }
 

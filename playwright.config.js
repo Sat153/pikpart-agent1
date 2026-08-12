@@ -3,7 +3,7 @@ const { defineConfig, devices } = require("@playwright/test");
 
 module.exports = defineConfig({
   testDir: "./tests",
-  timeout: 45_000,
+  timeout: 90_000,
   expect: { timeout: 8_000 },
   fullyParallel: false, // retailer approval flows share state - run in order
   retries: 1,
